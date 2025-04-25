@@ -9,6 +9,5 @@ groq
 streamlit-aggrid
 sqlglot
 fuzzywuzzy
-snowflake-connector-python[pandas]
-pyarrow
+pyarrow==18.1.0
 python-Levenshtein
