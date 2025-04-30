@@ -1,4 +1,4 @@
-# model.py
+# models.py
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
@@ -44,8 +44,9 @@ class ChatHistory(Base):
     title = Column(String)
     timestamp = Column(DateTime(timezone=True))
     messages = Column(String)  # JSON string
-    persistent_df_paths = Column(String)  # JSON string of file paths
+    persistent_df_paths = Column(String)  # JSON string of file paths (will not be used anymore)
     persistent_df_mappings = Column(String)  # JSON string mapping assistant messages to DFs
+    small_tables_data = Column(String, nullable=True)  # NEW: JSON string for small tables data
 
 
 
