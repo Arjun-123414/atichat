@@ -458,40 +458,37 @@ def maybe_autosave_chat():
             st.session_state.chat_history) == st.session_state.last_saved_message_count:
         return
 
-    # Save the current conversation (without DataFrames)
+    # Save the current conversation with small tables
     save_chat_session_to_db(
         user=st.session_state["user"],
-        messages=st.session_state.chat_history
+        messages=st.session_state.chat_history,
+        persistent_dfs=st.session_state.persistent_dfs if "persistent_dfs" in st.session_state else [],
+        chat_message_tables=st.session_state.chat_message_tables if "chat_message_tables" in st.session_state else {}
     )
 
     # Update last save time and message count
     st.session_state.last_save_time = current_time
     st.session_state.last_saved_message_count = len(st.session_state.chat_history)
-
 def save_after_exchange():
-    """
-    Save the conversation immediately after each user-assistant exchange.
-    This ensures no data is lost if the application crashes.
-    """
+    """Save the conversation immediately after each user-assistant exchange."""
     if not st.session_state.chat_history:
         return
 
-    # Save the current conversation (without DataFrames)
+    # Save the current conversation with small tables
     save_chat_session_to_db(
         user=st.session_state["user"],
-        messages=st.session_state.chat_history
+        messages=st.session_state.chat_history,
+        persistent_dfs=st.session_state.persistent_dfs if "persistent_dfs" in st.session_state else [],
+        chat_message_tables=st.session_state.chat_message_tables if "chat_message_tables" in st.session_state else {}
     )
 
     # Update tracking variables
     st.session_state.last_save_time = time.time()
     st.session_state.last_saved_message_count = len(st.session_state.chat_history)
 
-
 # --- MODIFIED save_chat_session_to_db ---
-def save_chat_session_to_db(user, messages):
-    """Save the current conversation to DB, but without storing DataFrames.
-    Only chat messages are preserved.
-    """
+def save_chat_session_to_db(user, messages, persistent_dfs=None, chat_message_tables=None):
+    """Save the current conversation to DB, storing small DataFrames (under 1000 rows) as JSON."""
     if not messages:
         return
 
@@ -502,10 +499,22 @@ def save_chat_session_to_db(user, messages):
     else:
         title = "New Chat (" + datetime.datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S') + ")"
 
-    messages_json = json.dumps(messages)
+    # Store small tables data
+    small_tables = {}
+    if persistent_dfs and chat_message_tables:
+        for msg_idx, df_idx in chat_message_tables.items():
+            if df_idx < len(persistent_dfs):
+                df = persistent_dfs[df_idx]
+                if len(df) <= 1000:  # Only store tables with 1000 rows or fewer
+                    # Convert DataFrame to dict and store with message index as key
+                    small_tables[str(msg_idx)] = {
+                        'data': df.to_dict(orient='records'),
+                        'columns': df.columns.tolist()
+                    }
 
-    # Store empty mappings for compatibility
-    df_mappings_json = json.dumps({})
+    messages_json = json.dumps(messages)
+    small_tables_json = json.dumps(small_tables) if small_tables else "{}"
+    df_mappings_json = json.dumps(chat_message_tables) if chat_message_tables else "{}"
 
     db_session = SessionLocal()
     try:
@@ -519,6 +528,7 @@ def save_chat_session_to_db(user, messages):
                 existing_chat.messages = messages_json
                 existing_chat.persistent_df_paths = "[]"  # Empty array as JSON
                 existing_chat.persistent_df_mappings = df_mappings_json
+                existing_chat.small_tables_data = small_tables_json  # Save small tables
                 db_session.commit()
                 return
 
@@ -529,7 +539,8 @@ def save_chat_session_to_db(user, messages):
             timestamp=datetime.datetime.now(timezone.utc),
             messages=messages_json,
             persistent_df_paths="[]",  # Empty array as JSON
-            persistent_df_mappings=df_mappings_json
+            persistent_df_mappings=df_mappings_json,
+            small_tables_data=small_tables_json  # Save small tables
         )
         db_session.add(chat_record)
         db_session.commit()
@@ -549,13 +560,22 @@ def load_chat_sessions_for_user(user_email):
     try:
         results = db_session.query(ChatHistory).filter(ChatHistory.user == user_email).all()
         for s in results:
+            # Include small_tables_data in the returned sessions
+            small_tables_data = {}
+            if hasattr(s, 'small_tables_data') and s.small_tables_data:
+                try:
+                    small_tables_data = json.loads(s.small_tables_data)
+                except:
+                    small_tables_data = {}
+
             sessions.append({
                 "id": s.id,
                 "user": s.user,
                 "title": s.title,
                 "timestamp": s.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
                 "messages": json.loads(s.messages),
-                "persistent_df_paths": json.loads(s.persistent_df_paths)
+                "persistent_df_paths": [],  # Empty list for compatibility
+                "small_tables_data": small_tables_data
             })
     except Exception as e:
         print(f"Error loading chat sessions: {e}")
@@ -564,7 +584,7 @@ def load_chat_sessions_for_user(user_email):
     return sessions
 
 
-# --- MODIFIED load_conversation_into_session ---
+# 5. MODIFY the load_conversation_into_session function
 def load_conversation_into_session(conversation):
     """Load the chosen conversation into session_state so user can continue."""
     # Load the full conversation for context (used for generating responses)
@@ -572,17 +592,34 @@ def load_conversation_into_session(conversation):
     # For display, filter out the system message
     st.session_state.chat_history = [msg for msg in conversation["messages"] if msg["role"] != "system"]
 
-    # Reset the persistent DataFrames (they are not loaded from storage anymore)
+    # Initialize empty persistent_dfs
     st.session_state.persistent_dfs = []
 
-    # Reset the chat_message_tables mapping
+    # Initialize empty chat_message_tables
     st.session_state.chat_message_tables = {}
+
+    # Process small tables if available
+    if "small_tables_data" in conversation and conversation["small_tables_data"]:
+        small_tables = conversation["small_tables_data"]
+        for msg_idx_str, table_data in small_tables.items():
+            # Convert string key to integer
+            msg_idx = int(msg_idx_str)
+
+            # Create DataFrame from saved data
+            if 'data' in table_data and 'columns' in table_data:
+                df = pd.DataFrame(table_data['data'], columns=table_data['columns'])
+
+                # Add to persistent_dfs
+                df_idx = len(st.session_state.persistent_dfs)
+                st.session_state.persistent_dfs.append(df)
+
+                # Map to message
+                st.session_state.chat_message_tables[msg_idx] = df_idx
 
     # Store the conversation ID so we can update it rather than create new ones
     st.session_state.current_chat_id = conversation["id"]
     st.session_state.last_saved_message_count = len(conversation["messages"])
     st.session_state.last_save_time = time.time()
-
 
 # ---------------------------------------------
 # 7. Query Logging (existing from your code)
@@ -920,16 +957,19 @@ def main_app():
         st.write("---")
         # 3. New Chat button
         if st.button("🆕 New Chat"):
-            # Save the current conversation (if any) but without DataFrames
+            # Save the current conversation (if any) with small tables
             if st.session_state.chat_history:
                 save_chat_session_to_db(
                     user=st.session_state["user"],
-                    messages=st.session_state.chat_history
+                    messages=st.session_state.chat_history,
+                    persistent_dfs=st.session_state.persistent_dfs if "persistent_dfs" in st.session_state else [],
+                    chat_message_tables=st.session_state.chat_message_tables if "chat_message_tables" in st.session_state else {}
                 )
             # Clear the active session
             st.session_state.pop("messages", None)
             st.session_state.pop("chat_history", None)
             st.session_state.pop("persistent_dfs", None)
+            st.session_state.pop("chat_message_tables", None)
             st.session_state.pop("current_chat_id", None)
             st.session_state.pop("last_saved_message_count", None)
             st.rerun()
@@ -1738,20 +1778,26 @@ def main_app():
         Display table with appropriate handling based on row size:
         - For tables > 100,000 rows: Show only download button
         - For tables <= 100,000 rows: Show download button + AgGrid table
-        - Shows warning that download is only available now
+        - For tables > 1000 rows: Show warning about temporary availability
+        - For tables <= 1000 rows: Display normally (these are saved in session)
 
         Parameters:
         - df: pandas DataFrame to display
         - message_index: Current message index for unique key generation
         - df_idx: DataFrame index in persistent store
         """
-        # Display warning about download availability
-        st.warning(
-            "⚠️ **Download is only available now!** This data won't be accessible for download after navigating away from this page.",
-            icon="⚠️")
-
         # Always provide download option regardless of size
         csv = df.to_csv(index=False).encode("utf-8")
+
+        # Check row count to determine display method and warnings
+        num_rows = len(df)
+
+        if num_rows > 1000:
+            # Warning for large tables that won't be saved
+            st.warning(
+                "⚠️ **Download is only available now!** This data is too large to save with your chat history and won't be accessible for download after navigating away from this page.",
+                icon="⚠️")
+
         st.download_button(
             label="Download Full Dataset as CSV",
             data=csv,
@@ -1759,9 +1805,6 @@ def main_app():
             mime="text/csv",
             key=f"download_csv_{message_index}_{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}"
         )
-
-        # Check row count to determine display method
-        num_rows = len(df)
 
         if num_rows <= 200000:
             # For tables under the threshold, show interactive AgGrid
