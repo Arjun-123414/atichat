@@ -22,7 +22,6 @@ import base64
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
 
-
 # ------------------------
 # Constants for Autosave
 # ------------------------
@@ -437,11 +436,7 @@ def password_change_page():
                 st.error("Incorrect current password!")
 
 
-# ---------------------------------------------
-# 6. Chat History Persistence (DB + CSV files)
-# ---------------------------------------------
-PERSISTENT_DF_FOLDER = "chat_data"
-os.makedirs(PERSISTENT_DF_FOLDER, exist_ok=True)
+
 
 
 # --- NEW FUNCTION: Autosave check ---
@@ -463,17 +458,15 @@ def maybe_autosave_chat():
             st.session_state.chat_history) == st.session_state.last_saved_message_count:
         return
 
-    # Save the current conversation
+    # Save the current conversation (without DataFrames)
     save_chat_session_to_db(
         user=st.session_state["user"],
-        messages=st.session_state.chat_history,
-        persistent_dfs=st.session_state.persistent_dfs
+        messages=st.session_state.chat_history
     )
 
     # Update last save time and message count
     st.session_state.last_save_time = current_time
     st.session_state.last_saved_message_count = len(st.session_state.chat_history)
-
 
 def save_after_exchange():
     """
@@ -483,23 +476,21 @@ def save_after_exchange():
     if not st.session_state.chat_history:
         return
 
-    # Save the current conversation
+    # Save the current conversation (without DataFrames)
     save_chat_session_to_db(
         user=st.session_state["user"],
-        messages=st.session_state.chat_history,
-        persistent_dfs=st.session_state.persistent_dfs
+        messages=st.session_state.chat_history
     )
 
     # Update tracking variables
     st.session_state.last_save_time = time.time()
     st.session_state.last_saved_message_count = len(st.session_state.chat_history)
 
-MAX_ROWS_TO_PERSIST = 100000
+
 # --- MODIFIED save_chat_session_to_db ---
-def save_chat_session_to_db(user, messages, persistent_dfs):
-    """Save the current conversation to DB, storing DataFrames as CSV files.
-    Avoid duplicate titles by checking for an existing chat session.
-    Skip saving very large tables to save storage space.
+def save_chat_session_to_db(user, messages):
+    """Save the current conversation to DB, but without storing DataFrames.
+    Only chat messages are preserved.
     """
     if not messages:
         return
@@ -511,33 +502,10 @@ def save_chat_session_to_db(user, messages, persistent_dfs):
     else:
         title = "New Chat (" + datetime.datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S') + ")"
 
-    df_file_paths = []
-    # Create a new mapping that tracks which tables were too large to save
-    large_tables = []
-
-    for i, df in enumerate(persistent_dfs):
-        # Check if the table is too large to save
-        if len(df) > MAX_ROWS_TO_PERSIST:
-            # Don't save this table, just record its index
-            large_tables.append(i)
-            # Add a placeholder path (empty string)
-            df_file_paths.append("")
-            continue
-
-        # Save smaller tables as normal
-        filename = f"{user}_{datetime.datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex}_{i}.csv"
-        file_path = os.path.join(PERSISTENT_DF_FOLDER, filename)
-        df.to_csv(file_path, index=False)
-        df_file_paths.append(file_path)
-
     messages_json = json.dumps(messages)
-    df_paths_json = json.dumps(df_file_paths)
 
-    # Store which tables were too large to save
-    large_tables_json = json.dumps(large_tables)
-
-    # Store the mapping between messages and tables
-    df_mappings_json = json.dumps(st.session_state.chat_message_tables)
+    # Store empty mappings for compatibility
+    df_mappings_json = json.dumps({})
 
     db_session = SessionLocal()
     try:
@@ -549,10 +517,8 @@ def save_chat_session_to_db(user, messages, persistent_dfs):
                 existing_chat.title = title
                 existing_chat.timestamp = datetime.datetime.now(timezone.utc)
                 existing_chat.messages = messages_json
-                existing_chat.persistent_df_paths = df_paths_json
+                existing_chat.persistent_df_paths = "[]"  # Empty array as JSON
                 existing_chat.persistent_df_mappings = df_mappings_json
-                # Add large tables info to existing chat
-                existing_chat.large_tables = large_tables_json
                 db_session.commit()
                 return
 
@@ -562,9 +528,8 @@ def save_chat_session_to_db(user, messages, persistent_dfs):
             title=title,
             timestamp=datetime.datetime.now(timezone.utc),
             messages=messages_json,
-            persistent_df_paths=df_paths_json,
-            persistent_df_mappings=df_mappings_json,
-            large_tables=large_tables_json  # Add the large tables info
+            persistent_df_paths="[]",  # Empty array as JSON
+            persistent_df_mappings=df_mappings_json
         )
         db_session.add(chat_record)
         db_session.commit()
@@ -577,7 +542,6 @@ def save_chat_session_to_db(user, messages, persistent_dfs):
         db_session.close()
 
 
-# Update the load_chat_sessions_for_user function to include large_tables info
 def load_chat_sessions_for_user(user_email):
     """Return a list of all conversation dicts for this user."""
     db_session = SessionLocal()
@@ -591,8 +555,7 @@ def load_chat_sessions_for_user(user_email):
                 "title": s.title,
                 "timestamp": s.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
                 "messages": json.loads(s.messages),
-                "persistent_df_paths": json.loads(s.persistent_df_paths),
-                "large_tables": json.loads(s.large_tables) if hasattr(s, 'large_tables') and s.large_tables else []
+                "persistent_df_paths": json.loads(s.persistent_df_paths)
             })
     except Exception as e:
         print(f"Error loading chat sessions: {e}")
@@ -601,7 +564,7 @@ def load_chat_sessions_for_user(user_email):
     return sessions
 
 
-# Update the load_conversation_into_session function
+# --- MODIFIED load_conversation_into_session ---
 def load_conversation_into_session(conversation):
     """Load the chosen conversation into session_state so user can continue."""
     # Load the full conversation for context (used for generating responses)
@@ -609,53 +572,11 @@ def load_conversation_into_session(conversation):
     # For display, filter out the system message
     st.session_state.chat_history = [msg for msg in conversation["messages"] if msg["role"] != "system"]
 
-    loaded_dfs = []
-    # Get the list of tables that were too large to save
-    large_tables = conversation.get("large_tables", [])
-
-    # Load available dataframes
-    for i, path in enumerate(conversation["persistent_df_paths"]):
-        # Check if this was a large table that wasn't saved
-        if i in large_tables or not path:
-            # Create a placeholder DataFrame with a message
-            placeholder_df = pd.DataFrame({
-                "Notice": ["This large table (100,000+ rows) was not saved to preserve storage space."],
-                "Action": ["You can run the query again to view the full results."]
-            })
-            loaded_dfs.append(placeholder_df)
-        else:
-            # Load normal dataframe
-            try:
-                loaded_dfs.append(pd.read_csv(path))
-            except Exception as e:
-                st.error(f"Error loading DataFrame from {path}: {e}")
-                # Add a placeholder for the failed load
-                placeholder_df = pd.DataFrame({
-                    "Error": [f"Could not load table: {e}"]
-                })
-                loaded_dfs.append(placeholder_df)
-
-    st.session_state.persistent_dfs = loaded_dfs
+    # Reset the persistent DataFrames (they are not loaded from storage anymore)
+    st.session_state.persistent_dfs = []
 
     # Reset the chat_message_tables mapping
     st.session_state.chat_message_tables = {}
-
-    # Only assign tables to messages that mention "result is displayed below" or similar phrases
-    df_index = 0
-    assistant_index = 0
-
-    for msg in st.session_state.chat_history:
-        if msg["role"] == "assistant":
-            # Look for phrases that indicate a table should follow
-            if (df_index < len(loaded_dfs) and
-                    ("result is displayed below" in msg["content"] or
-                     "rows. The result is displayed below" in msg["content"] or
-                     "below" in msg["content"] and "row" in msg["content"])):
-                # This message should have a table
-                st.session_state.chat_message_tables[assistant_index] = df_index
-                df_index += 1
-
-            assistant_index += 1
 
     # Store the conversation ID so we can update it rather than create new ones
     st.session_state.current_chat_id = conversation["id"]
@@ -999,12 +920,11 @@ def main_app():
         st.write("---")
         # 3. New Chat button
         if st.button("🆕 New Chat"):
-            # Save the current conversation (if any)
+            # Save the current conversation (if any) but without DataFrames
             if st.session_state.chat_history:
                 save_chat_session_to_db(
                     user=st.session_state["user"],
-                    messages=st.session_state.chat_history,
-                    persistent_dfs=st.session_state.persistent_dfs
+                    messages=st.session_state.chat_history
                 )
             # Clear the active session
             st.session_state.pop("messages", None)
@@ -1116,7 +1036,7 @@ def main_app():
                                         - “Give open orders for XYZ Corp”
                                         - “Fetch cancelled POs from Alpha Ltd”
                                     • These cases imply PO-level tracking per entity and must strictly use `po_details_view`.
-                        
+
                                 **1.3 Time & Date Handling:**
                                    1. Use DATEDIFF(DAY, col1, col2) instead of DATEDIFF(col1, col2).
                                    2. Use DATEADD() for date arithmetic (e.g., DATEADD(DAY, -7, CURRENT_DATE)).
@@ -1141,7 +1061,7 @@ def main_app():
                                                 This quarter | EXTRACT(QUARTER FROM col) = EXTRACT(QUARTER FROM CURRENT_DATE()) AND EXTRACT(YEAR FROM col) = EXTRACT(YEAR FROM CURRENT_DATE())
                                                 Last quarter | EXTRACT(QUARTER FROM col) = EXTRACT(QUARTER FROM DATEADD(QUARTER, -1, CURRENT_DATE())) AND EXTRACT(YEAR FROM col) = EXTRACT(YEAR FROM DATEADD(QUARTER, -1, CURRENT_DATE()))
 
-                                                                        
+
                                 **1.4 Query Structuring:**
                                    1. Use **aliases for readability** (e.g., FROM "order_details" AS od).
                                    2. Never use **ORDER BY inside UNION subqueries**—use LIMIT instead.
@@ -1164,20 +1084,20 @@ def main_app():
                                        → Use COUNT(column_name)
                                     2. If the word **"total"** is NOT present:
                                        → Use COUNT(DISTINCT column_name)
-                                    
+
                                     🔁 This rule is absolute. Do not assume. Always check for the word "total".
-                                    
+
                                     📚 Examples:
-                                    
+
                                     • "How many customers?" → COUNT(DISTINCT customer_id)
                                     • "What is the total number of customers?" → COUNT(customer_id)
                                     • "Vendors in the last month?" → COUNT(DISTINCT vendor_id)
                                     • "Total vendors this year" → COUNT(vendor_id)
                                     • "How many requisitions?" → COUNT(DISTINCT requisition_id)
                                     • "Total requisitions for February" → COUNT(requisition_id)
-                                    
+
                                     🚫 Wrong usage will break logic. Stick to this rule no matter what.
-                                       
+
                                 **1.6 QUERY TEMPLATE USAGE (MANDATORY):**
                                    1. **⚠️ CRITICAL INSTRUCTION: ALWAYS use the pre-defined query templates provided below instead of SELECT * ⚠️**
                                    2. For each table, use ONLY the corresponding template when displaying full table data.
@@ -1187,7 +1107,7 @@ def main_app():
                                       • The query requires aggregation or transformation of the data
                                    4. NEVER use SELECT * in ANY query - this is strictly prohibited.
                                    5. These templates are carefully designed to show the most relevant columns with proper aliases - using them is MANDATORY.
-                                   
+
                                 **1.7 COMPARISON QUERY RULES (🟡 COMMON & IMPORTANT):**
                                    When the user wants to compare values (e.g., sales, cost, profit, quantities) across one or more entities (like vendors, projects, locations, business units, time periods, etc.), follow this logic:
                                     1. **Multi-entity Comparison**  
@@ -1273,25 +1193,7 @@ def main_app():
                                     GROUP BY ITEM_DESC
                                     ORDER BY total_profit DESC
                                     LIMIT 10;
-                                ** 1.9 Multi-Table Join Templates **
-                                      1. Payment Status on PO (Purchase Order)
-                                        **When to use:**
-                                        When the user asks about the payment status related to a specific Purchase Order (PO).
-                                        **Query Template**
-                                        SELECT
-                                          a.CLOSED_DATE        AS PAYMENT_DATE,
-                                          a.INVOICE_AMOUNT,
-                                          a.PAID_AMOUNT,
-                                          a.PAYM_MODE          AS PAYMENT_MODE,
-                                          a.JOURNAL_NUM,
-                                          a.VOUCHER
-                                        FROM po_details_view p
-                                        LEFT JOIN ap_invoice_paid_view a
-                                          ON a.INVOICE_NO = p.LATEST_INVOICE
-                                        WHERE p."Purchase_Order" = '<PO_NUMBER>'
-                                        ORDER BY a.CLOSED_DATE;
-                                      **Note:** Replace <PO_NUMBER> dynamically based on user input.
-                                      
+
                             ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
                             **2. TABLE-SPECIFIC RULES**
 
@@ -1332,7 +1234,7 @@ def main_app():
                                         • "LATEST_INVOICE_DT" AS "Last Invoice Date"
                                         • "Created_By" AS "Created_By"
                                         • "Created_On" AS "Created_On"
-                                        
+
                                 • If user asks about project progress/status, add this filter:
                                     (e.g., “How many orders we won this month” → use "JOB_STAGE" = 'Won')
                                     WHERE "JOB_STAGE" = '<Relevant Stage>'
@@ -1423,7 +1325,7 @@ def main_app():
                                 4. **Vendor Count Rule:**
                                    • For any query asking for vendor count or supplier count, use:
                                      SELECT COUNT(DISTINCT "Vendor") FROM "PO_DETAILS_VIEW";
-                                     
+
                                 5. **Purchase Requisition Count Handling:**
                                    • For any query asking for **PR count** or **Purchase Requisition count**, use:
                                      SELECT COUNT(DISTINCT "Purchase_Requisition") FROM "PO_DETAILS_VIEW" WHERE "Year" = {{year}};
@@ -1773,9 +1675,9 @@ def main_app():
                                 Still under estimation / under review |	WHERE JOB_STAGE = 'Estimating/Review'
                                 In qualification	                  | WHERE JOB_STAGE = 'Qualification'
                                 Fully closed projects	              | WHERE JOB_STAGE = 'Closed'
-                                 
-                                            
-                                 
+
+
+
                             --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
                             **3.USER ROLE INFORMATION:**
                                **3.1 User Information**
@@ -1836,21 +1738,17 @@ def main_app():
         Display table with appropriate handling based on row size:
         - For tables > 100,000 rows: Show only download button
         - For tables <= 100,000 rows: Show download button + AgGrid table
-        - For placeholder tables (unsaved large tables): Show a message
+        - Shows warning that download is only available now
 
         Parameters:
         - df: pandas DataFrame to display
         - message_index: Current message index for unique key generation
         - df_idx: DataFrame index in persistent store
         """
-        # Check if this is a placeholder for a large table that wasn't saved
-        if (len(df) == 1 and
-                "Notice" in df.columns and
-                "large table" in str(df["Notice"].iloc[0])):
-            # This is a placeholder for a table that was too large to save
-            st.warning(
-                "⚠️ This large table (100,000+ rows) was not saved to preserve storage space. You can run the query again to view the full results.")
-            return
+        # Display warning about download availability
+        st.warning(
+            "⚠️ **Download is only available now!** This data won't be accessible for download after navigating away from this page.",
+            icon="⚠️")
 
         # Always provide download option regardless of size
         csv = df.to_csv(index=False).encode("utf-8")
@@ -1864,11 +1762,6 @@ def main_app():
 
         # Check row count to determine display method
         num_rows = len(df)
-
-        # Add persistence information if this is a large table
-        if num_rows > MAX_ROWS_TO_PERSIST:
-            st.info(
-                f"📝 Note: This table has {num_rows:,} rows and won't be saved when you navigate away. Download it now if you need to keep it.")
 
         if num_rows <= 200000:
             # For tables under the threshold, show interactive AgGrid
@@ -1936,31 +1829,6 @@ def main_app():
         cleaned = re.sub(r',(?=\S)', ', ', cleaned)
         cleaned = re.sub(r'\s{2,}', ' ', cleaned)
         return cleaned.strip()
-
-    def format_llm_response(text: str) -> str:
-        """
-        Formats LLM responses into clean HTML using preferred font and bold keys.
-        Handles all 'Key: Value' lines dynamically.
-        """
-        import html
-
-        lines = text.strip().split('\n')
-        formatted_lines = []
-
-        for line in lines:
-            if ':' in line:
-                key, value = line.split(':', 1)
-                formatted_lines.append(
-                    f"<div><strong>{html.escape(key.strip())}:</strong> {html.escape(value.strip())}</div>")
-            else:
-                formatted_lines.append(f"<div>{html.escape(line.strip())}</div>")
-
-        html_output = f"""
-        <div style="font-family: Arial, sans-serif; font-size: 16px; color: #333; line-height: 1.6; padding: 8px 0;">
-            {''.join(formatted_lines)}
-        </div>
-        """
-        return html_output
 
     if prompt := st.chat_input("Ask about your Snowflake data..."):
         st.session_state.messages.append({"role": "user", "content": prompt})
@@ -2076,8 +1944,6 @@ def main_app():
                     # Customize message based on row count
                     if num_rows > 200000:
                         natural_response = f"Query returned {num_rows:,} rows. Due to the large size of the result, only a download option is provided below. You can download the full dataset as a CSV file for viewing in your preferred spreadsheet application."
-                    elif num_rows > MAX_ROWS_TO_PERSIST:
-                        natural_response = f"Query returned {num_rows:,} rows. The result is displayed below. Note: Due to the large size, this table won't be saved when you navigate away from this chat."
                     else:
                         natural_response = f"Query returned {num_rows:,} rows. The result is displayed below:"
 
@@ -2135,7 +2001,6 @@ def main_app():
                     natural_response, token_usage_second_call = get_groq_response_with_system(temp_messages)
                     st.session_state.total_tokens += token_usage_second_call
                     natural_response = clean_llm_response(natural_response)
-
                     with progress_container:
                         status_text.markdown(
                             "<div style='color:#3366ff; font-weight:bold;'>✨ Formatting results for display...</div>",
@@ -2183,8 +2048,10 @@ def main_app():
             # Show final answer in the response container
             with response_container:
                 with st.chat_message("assistant"):
-                    formatted_html = format_llm_response(natural_response)
-                    st.markdown(formatted_html, unsafe_allow_html=True)
+                    st.markdown(
+                        f"<div style='font-family:Arial, sans-serif; font-size:16px; color:#333; line-height:1.6;'>{natural_response}</div>",
+                        unsafe_allow_html=True
+                    )
 
                     current_message_idx = len(
                         [m for m in st.session_state.chat_history if m["role"] == "assistant"]
